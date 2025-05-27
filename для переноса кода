@@ -1,0 +1,13 @@
+from setuptools import setup
+from Cython.Build import cythonize
+
+setup(
+    ext_modules=cythonize(
+        "fast_sha256.pyx",  # Имя вашего .pyx файла
+        compiler_directives={
+            'language_level': "3",  # Языковая версия Python
+            'boundscheck': False,   # Отключение проверки границ
+            'wraparound': False     # Отключение отрицательных индексов
+        }
+    )
+)
