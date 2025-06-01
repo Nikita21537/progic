@@ -1,194 +1,386 @@
 import os
+import sys
 import time
-import argparse
-from array import array
-from tqdm import tqdm
-from fast_sha256 import SHA256, generate_key, PRNG, xor_bytes, substitution, permutation
-
-# --- Constants ---
-S1 = bytes([
-    0x63, 0x7C, 0x77, 0x7B, 0xF2, 0x6B, 0x6F, 0xC5, 0x30, 0x01, 0x67, 0x2B, 0xFE, 0xD7, 0xAB, 0x76,
-    0xCA, 0x82, 0xC9, 0x7D, 0xFA, 0x59, 0x47, 0xF0, 0xAD, 0xD4, 0xA2, 0xAF, 0x9C, 0xA4, 0x72, 0xC0,
-    0xB7, 0xFD, 0x93, 0x26, 0x36, 0x3F, 0xF7, 0xCC, 0x34, 0xA5, 0xE5, 0xF1, 0x71, 0xD8, 0x31, 0x15,
-    0x04, 0xC7, 0x23, 0xC3, 0x18, 0x96, 0x05, 0x9A, 0x07, 0x12, 0x80, 0xE2, 0xEB, 0x27, 0xB2, 0x75,
-    0x09, 0x83, 0x2C, 0x1A, 0x1B, 0x6E, 0x5A, 0xA0, 0x52, 0x3B, 0xD6, 0xB3, 0x29, 0xE3, 0x2F, 0x84,
-    0x53, 0xD1, 0x00, 0xED, 0x20, 0xFC, 0xB1, 0x5B, 0x6A, 0xCB, 0xBE, 0x39, 0x4A, 0x4C, 0x58, 0xCF,
-    0xD0, 0xEF, 0xAA, 0xFB, 0x43, 0x4D, 0x33, 0x85, 0x45, 0xF9, 0x02, 0x7F, 0x50, 0x3C, 0x9F, 0xA8,
-    0x51, 0xA3, 0x40, 0x8F, 0x92, 0x9D, 0x38, 0xF5, 0xBC, 0xB6, 0xDA, 0x21, 0x10, 0xFF, 0xF3, 0xD2,
-    0xCD, 0x0C, 0x13, 0xEC, 0x5F, 0x97, 0x44, 0x17, 0xC4, 0xA7, 0x7E, 0x3D, 0x64, 0x5D, 0x19, 0x73,
-    0x60, 0x81, 0x4F, 0xDC, 0x22, 0x2A, 0x90, 0x88, 0x46, 0xEE, 0xB8, 0x14, 0xDE, 0x5E, 0x0B, 0xDB,
-    0xE0, 0x32, 0x3A, 0x0A, 0x49, 0x06, 0x24, 0x5C, 0xC2, 0xD3, 0xAC, 0x62, 0x91, 0x95, 0xE4, 0x79,
-    0xE7, 0xC8, 0x37, 0x6D, 0x8D, 0xD5, 0x4E, 0xA9, 0x6C, 0x56, 0xF4, 0xEA, 0x65, 0x7A, 0xAE, 0x08,
-    0xBA, 0x78, 0x25, 0x2E, 0x1C, 0xA6, 0xB4, 0xC6, 0xE8, 0xDD, 0x74, 0x1F, 0x4B, 0xBD, 0x8B, 0x8A,
-    0x70, 0x3E, 0xB5, 0x66, 0x48, 0x03, 0xF6, 0x0E, 0x61, 0x35, 0x57, 0xB9, 0x86, 0xC1, 0x1D, 0x9E,
-    0xE1, 0xF8, 0x98, 0x11, 0x69, 0xD9, 0x8E, 0x94, 0x9B, 0x1E, 0x87, 0xE9, 0xCE, 0x55, 0x28, 0xDF,
-    0x8C, 0xA1, 0x89, 0x0D, 0xBF, 0xE6, 0x42, 0x68, 0x41, 0x99, 0x2D, 0x0F, 0xB0, 0x54, 0xBB, 0x16
-])
-S2 = bytes([255 - i for i in range(256)])
-P1_order = array('i', list(reversed(range(16))))
-P2_order = array('i', [4, 5, 6, 7, 0, 1, 2, 3, 12, 13, 14, 15, 8, 9, 10, 11])
-P2_inv = array('i', [P2_order.tolist().index(i) for i in range(16)])
+import struct
+import multiprocessing
+from typing import List, Tuple
 
 
-# --- Batched Processing ---
-def process_chunk(chunk, prng, block_size=16, encrypt=True):
-    buffer = bytearray(chunk)
-    result = bytearray()
-    blocks = [bytes(buffer[i:i + block_size]) for i in range(0, len(buffer), block_size)]
-    if not blocks:
-        return bytes(result), buffer
-    total_rand = len(blocks) * block_size
-    rand_data = prng.rand_bytes(total_rand)
-    if encrypt:
-        for i, block in enumerate(blocks):
+class CryptoCLI:
+    def __init__(self, verbose: bool = False):
+        self.verbose = verbose
+        self.logs = []
+
+    def log(self, message: str):
+        if self.verbose:
+            print(message)
+        self.logs.append(message)
+
+    @staticmethod
+    def _rotate_left(value: int, shift: int, bits: int = 32) -> int:
+        shift %= bits
+        return ((value << shift) | (value >> (bits - shift))) & ((1 << bits) - 1)
+
+    @staticmethod
+    def _rotate_right(value: int, shift: int, bits: int = 32) -> int:
+        shift %= bits
+        return ((value >> shift) | (value << (bits - shift))) & ((1 << bits) - 1)
+
+    def _pseudo_random_generator(self, seed: int, count: int) -> List[int]:
+        """Генератор псевдослучайных чисел на основе Xorshift32"""
+        self.log(f"Генерация {count} псевдослучайных чисел из seed {seed}")
+        numbers = []
+        x = seed & 0xFFFFFFFF
+        for _ in range(count):
+            x ^= (x << 13) & 0xFFFFFFFF
+            x ^= (x >> 17) & 0xFFFFFFFF
+            x ^= (x << 5) & 0xFFFFFFFF
+            x &= 0xFFFFFFFF
+            numbers.append(x)
+        self.log(f"Сгенерировано чисел: {numbers[:5]}... (всего {len(numbers)})")
+        return numbers
+
+    def _derive_key(self, passphrase: str) -> bytes:
+        self.log("Генерация ключа из парольной фразы...")
+        hash_value = 5381
+        for c in passphrase:
+            hash_value = ((hash_value << 5) + hash_value) + ord(c)
+            hash_value &= 0xFFFFFFFF
+
+        self.log(f"Хэш парольной фразы: {hash_value}")
+        random_numbers = self._pseudo_random_generator(hash_value, 8)
+        key = b''.join(struct.pack('>I', num) for num in random_numbers)
+        self.log(f"Сгенерированный ключ: {key.hex()}")
+        return key
+
+    def _add_integrity_check(self, data: bytes) -> bytes:
+        """Добавляет проверочную сумму к данным"""
+        self.log("Добавление проверки целостности...")
+        import hashlib
+        checksum = hashlib.sha256(data).digest()
+        result = struct.pack('>I', len(data)) + checksum + data
+        self.log(f"Данные с проверкой целостности: {len(result)} байт (оригинал: {len(data)} байт)")
+        return result
+
+    def _verify_integrity(self, data: bytes) -> bytes:
+        """Проверяет целостность данных и возвращает их если проверка пройдена"""
+        self.log("Проверка целостности данных...")
+        if len(data) < 36:  # 4 байта длины + 32 байта SHA256
+            raise ValueError("Некорректные данные: недостаточная длина для проверки целостности")
+
+        length = struct.unpack('>I', data[:4])[0]
+        checksum = data[4:36]
+        actual_data = data[36:36 + length]
+
+        self.log(f"Заявленная длина данных: {length} байт, фактическая: {len(actual_data)} байт")
+
+        if len(actual_data) != length:
+            raise ValueError("Некорректные данные: длина не соответствует заявленной")
+
+        import hashlib
+        actual_checksum = hashlib.sha256(actual_data).digest()
+
+        if actual_checksum != checksum:
+            self.log("Ошибка проверки целостности! Хэши не совпадают:")
+            self.log(f"Ожидаемый: {checksum.hex()}")
+            self.log(f"Полученный: {actual_checksum.hex()}")
+            raise ValueError("Ошибка проверки целостности: неверная парольная фраза или поврежденные данные")
+
+        self.log("Проверка целостности пройдена успешно")
+        return actual_data
+
+    def _substitution_step(self, data: bytes, key: bytes, reverse: bool = False) -> bytes:
+        self.log(f"Выполнение {'обратной ' if reverse else ''}подстановки...")
+        s_box = list(range(256))
+        key_bytes = key * (256 // len(key) + 1)
+
+        # Инициализация S-box
+        j = 0
+        for i in range(256):
+            j = (j + s_box[i] + key_bytes[i]) % 256
+            s_box[i], s_box[j] = s_box[j], s_box[i]
+
+        # Создание обратного S-box для дешифрования
+        if reverse:
+            s_box_inverse = [0] * 256
+            for idx, val in enumerate(s_box):
+                s_box_inverse[val] = idx
+            s_box = s_box_inverse
+
+        result = bytearray(len(data))
+        for i, b in enumerate(data):
+            result[i] = s_box[b]
+
+        self.log(f"Подстановка завершена. Размер данных: {len(result)} байт")
+        return bytes(result)
+
+    def _permutation_step(self, data: bytes, key: bytes, reverse: bool = False) -> bytes:
+        self.log(f"Выполнение {'обратной ' if reverse else ''}перестановки...")
+        data_len = len(data)
+        if data_len == 0:
+            return data
+
+        key_int = int.from_bytes(key[:4], 'big')
+        random_numbers = self._pseudo_random_generator(key_int, data_len)
+
+        # Генерация таблицы перестановок
+        indices = list(range(data_len))
+        for i in range(data_len):
+            swap_with = random_numbers[i] % data_len
+            indices[i], indices[swap_with] = indices[swap_with], indices[i]
+
+        # Для дешифрования создаем обратную перестановку
+        if reverse:
+            reverse_indices = [0] * data_len
+            for i, pos in enumerate(indices):
+                reverse_indices[pos] = i
+            indices = reverse_indices
+
+        result = bytearray(data_len)
+        for i, pos in enumerate(indices):
+            result[i] = data[pos]
+
+        self.log(f"Перестановка завершена. Размер данных: {len(result)} байт")
+        return bytes(result)
+
+    def _xor_with_key(self, data: bytes, key: bytes) -> bytes:
+        self.log("Выполнение операции XOR с ключом...")
+        key_bytes = key * (len(data) // len(key) + 1)
+        result = bytearray(len(data))
+        for i in range(len(data)):
+            result[i] = data[i] ^ key_bytes[i]
+        self.log(f"XOR завершен. Размер данных: {len(result)} байт")
+        return bytes(result)
+
+    @staticmethod
+    def _process_block(args: Tuple[int, bytes, bytes, bool]) -> Tuple[int, bytes]:
+        block_num, block_data, key, is_encrypt = args
+        crypto = CryptoCLI()
+        if is_encrypt:
+            crypto.log(f"Обработка блока {block_num} (шифрование, размер: {len(block_data)} байт)")
+            processed = crypto._substitution_step(block_data, key)
+            processed = crypto._permutation_step(processed, key)
+            processed = crypto._xor_with_key(processed, key)
+            processed = crypto._substitution_step(processed, key[::-1])
+            processed = crypto._permutation_step(processed, key[::-1])
+        else:
+            crypto.log(f"Обработка блока {block_num} (расшифрование, размер: {len(block_data)} байт)")
+            processed = crypto._permutation_step(block_data, key[::-1], reverse=True)
+            processed = crypto._substitution_step(processed, key[::-1], reverse=True)
+            processed = crypto._xor_with_key(processed, key)
+            processed = crypto._permutation_step(processed, key, reverse=True)
+            processed = crypto._substitution_step(processed, key, reverse=True)
+
+        crypto.log(f"Блок {block_num} обработан. Итоговый размер: {len(processed)} байт")
+        return (block_num, processed)
+
+    def _parallel_process(self, data: bytes, key: bytes, is_encrypt: bool,
+                          block_size: int = 4 * 1024) -> bytes:
+        self.log(f"Начало {'шифрования' if is_encrypt else 'расшифрования'}...")
+
+        if not data:
+            self.log("Пустые входные данные, возвращаем пустой результат")
+            return b''
+
+        # При шифровании добавляем проверку целостности
+        if is_encrypt:
+            data = self._add_integrity_check(data)
+
+        num_blocks = (len(data) + block_size - 1) // block_size
+        blocks = []
+        self.log(f"Разделение данных на {num_blocks} блоков по {block_size} байт")
+
+        for i in range(num_blocks):
             start = i * block_size
-            sub1 = substitution(block, S1)
-            perm1 = permutation(sub1, memoryview(P1_order))
-            sub2 = substitution(perm1, S2)
-            perm2 = permutation(sub2, P2_order)
-            result.extend(xor_bytes(perm2, rand_data[start:start + block_size]))
-    else:
-        for i, block in enumerate(blocks):
-            start = i * block_size
-            xor = xor_bytes(block, rand_data[start:start + block_size])
-            perm2 = permutation(xor, P2_inv)
-            sub2 = substitution(perm2, S2)
-            perm1 = permutation(sub2, P1_order)
-            result.extend(substitution(perm1, S1))
-    remaining = buffer[len(blocks) * block_size:]
-    return bytes(result), remaining
+            end = min((i + 1) * block_size, len(data))
+            block_data = data[start:end]
+            block_seed = int.from_bytes(key, 'big') ^ i
+            block_key = self._pseudo_random_generator(block_seed, 16)
+            block_key_bytes = b''.join(struct.pack('>I', num) for num in block_key[:8])
+
+            blocks.append((i, block_data, block_key_bytes, is_encrypt))
+            self.log(f"Блок {i}: размер {len(block_data)} байт, seed {block_seed}")
+
+        self.log(f"Запуск параллельной обработки с использованием {multiprocessing.cpu_count()} ядер...")
+        start_time = time.time()
+
+        with multiprocessing.Pool(multiprocessing.cpu_count()) as pool:
+            results = pool.map(self._process_block, blocks)
+
+        elapsed = time.time() - start_time
+        self.log(f"Параллельная обработка завершена за {elapsed:.2f} секунд")
+
+        results.sort(key=lambda x: x[0])
+        result = b''.join(data for _, data in results)
+        self.log(f"Собраны все блоки. Итоговый размер: {len(result)} байт")
+
+        # При расшифровке проверяем целостность
+        if not is_encrypt:
+            result = self._verify_integrity(result)
+
+        return result
+
+    def encrypt(self, data: bytes, passphrase: str) -> bytes:
+        self.log("\n=== НАЧАЛО ШИФРОВАНИЯ ===")
+        start_time = time.time()
+
+        key = self._derive_key(passphrase)
+        result = self._parallel_process(data, key, is_encrypt=True)
+
+        elapsed = time.time() - start_time
+        speed = len(data) * 8 / elapsed / 1e6 if elapsed > 0 else 0
+        self.log(f"Шифрование завершено. Скорость: {speed:.2f} Мбит/сек")
+        self.log(f"Исходный размер: {len(data)} байт, зашифрованный: {len(result)} байт")
+        self.log("=== ШИФРОВАНИЕ ЗАВЕРШЕНО ===\n")
+        return result
+
+    def decrypt(self, data: bytes, passphrase: str) -> bytes:
+        self.log("\n=== НАЧАЛО РАСШИФРОВАНИЯ ===")
+        start_time = time.time()
+
+        key = self._derive_key(passphrase)
+        result = self._parallel_process(data, key, is_encrypt=False)
+
+        elapsed = time.time() - start_time
+        speed = len(data) * 8 / elapsed / 1e6 if elapsed > 0 else 0
+        self.log(f"Расшифрование завершено. Скорость: {speed:.2f} Мбит/сек")
+        self.log(f"Зашифрованный размер: {len(data)} байт, расшифрованный: {len(result)} байт")
+        self.log("=== РАСШИФРОВАНИЕ ЗАВЕРШЕНО ===\n")
+        return result
+
+    def encrypt_file(self, input_path: str, output_path: str, passphrase: str):
+        self.log(f"\nШифрование файла {input_path} -> {output_path}")
+        try:
+            with open(input_path, 'rb') as f:
+                data = f.read()
+            self.log(f"Прочитано {len(data)} байт из исходного файла")
+
+            encrypted = self.encrypt(data, passphrase)
+
+            with open(output_path, 'wb') as f:
+                f.write(encrypted)
+            self.log(f"Зашифрованные данные записаны в {output_path}")
+        except Exception as e:
+            self.log(f"Ошибка при шифровании файла: {str(e)}")
+            raise
+
+    def decrypt_file(self, input_path: str, output_path: str, passphrase: str):
+        self.log(f"\nРасшифрование файла {input_path} -> {output_path}")
+        try:
+            with open(input_path, 'rb') as f:
+                data = f.read()
+            self.log(f"Прочитано {len(data)} байт из зашифрованного файла")
+
+            decrypted = self.decrypt(data, passphrase)
+
+            with open(output_path, 'wb') as f:
+                f.write(decrypted)
+            self.log(f"Расшифрованные данные записаны в {output_path}")
+        except ValueError as e:
+            self.log(f"Ошибка расшифрования: {str(e)}")
+            if os.path.exists(output_path):
+                os.remove(output_path)
+            raise
+        except Exception as e:
+            self.log(f"Ошибка при расшифровании файла: {str(e)}")
+            raise
+
+    def encrypt_directory(self, dir_path: str, output_file: str, passphrase: str):
+        self.log(f"\nШифрование каталога {dir_path} в файл {output_file}")
+        import tarfile
+        import io
+        try:
+            self.log("Создание tar-архива...")
+            tar_buffer = io.BytesIO()
+            with tarfile.open(fileobj=tar_buffer, mode='w:gz') as tar:
+                for root, _, files in os.walk(dir_path):
+                    for file in files:
+                        full_path = os.path.join(root, file)
+                        arcname = os.path.relpath(full_path, start=dir_path)
+                        tar.add(full_path, arcname=arcname)
+                        self.log(f"Добавлен файл: {arcname}")
+
+            self.log(f"Размер архива перед шифрованием: {tar_buffer.tell()} байт")
+            encrypted = self.encrypt(tar_buffer.getvalue(), passphrase)
+
+            with open(output_file, 'wb') as f:
+                f.write(encrypted)
+            self.log(f"Зашифрованный архив записан в {output_file}")
+        except Exception as e:
+            self.log(f"Ошибка при шифровании каталога: {str(e)}")
+            raise
+
+    def decrypt_directory(self, input_file: str, output_dir: str, passphrase: str):
+        self.log(f"\nРасшифрование файла {input_file} в каталог {output_dir}")
+        import tarfile
+        import io
+
+        try:
+            with open(input_file, 'rb') as f:
+                encrypted = f.read()
+            self.log(f"Прочитано {len(encrypted)} байт из зашифрованного файла")
+
+            decrypted = self.decrypt(encrypted, passphrase)
+            self.log(f"Размер расшифрованных данных: {len(decrypted)} байт")
+
+            tar_buffer = io.BytesIO(decrypted)
+            os.makedirs(output_dir, exist_ok=True)
+
+            self.log("Распаковка архива...")
+            with tarfile.open(fileobj=tar_buffer, mode='r:gz') as tar:
+                tar.extractall(path=output_dir)
+                self.log(f"Извлечено {len(tar.getmembers())} файлов в {output_dir}")
+        except ValueError as e:
+            self.log(f"Ошибка расшифрования: {str(e)}")
+            if os.path.exists(output_dir):
+                import shutil
+                shutil.rmtree(output_dir)
+            raise
+        except Exception as e:
+            self.log(f"Ошибка при расшифровании каталога: {str(e)}")
+            raise
 
 
-def encrypt_block(block, prng):
-    sub1 = substitution(block, S1)
-    perm1 = permutation(sub1, P1_order)
-    sub2 = substitution(perm1, S2)
-    perm2 = permutation(sub2, P2_order)
-    return xor_bytes(perm2, prng.rand_bytes(16))
-
-
-# --- File Encryption ---
-def encrypt_file(input_path, output_path, password, salt, verbose=False):
-    start_time = time.time()
-    key = generate_key(password.encode(), salt.encode())
-    prng = PRNG(int.from_bytes(key[:4], 'big'))
-    block_size = 16
-    file_size = os.path.getsize(input_path)
-    pad_len = block_size - (file_size % block_size or block_size)
-    padded_size = file_size + pad_len
-
-    with open(input_path, 'rb') as f_in, open(output_path, 'wb') as f_out:
-        with tqdm(total=padded_size, unit='B', unit_scale=True, desc='Шифрование', disable=not verbose) as pbar:
-            buffer = bytearray()
-            while True:
-                chunk = f_in.read(1024 * 1024 * 8)
-                if not chunk:
-                    break
-                buffer.extend(chunk)
-                processed, buffer = process_chunk(buffer, prng, block_size, encrypt=True)
-                f_out.write(processed)
-                pbar.update(len(processed))
-
-            if buffer:
-                pad = bytes([pad_len] * pad_len)
-                processed = encrypt_block(bytes(buffer) + pad, prng)
-                f_out.write(processed)
-                pbar.update(len(buffer) + pad_len)
-
-            hash_data = SHA256()
-            hash_data.update(bytes(buffer) + pad if buffer else b'')
-            hash_mask = prng.rand_bytes(32)
-            f_out.write(xor_bytes(hash_data.digest(), hash_mask))
-            pbar.update(32)
-
-    elapsed = time.time() - start_time
-    speed = padded_size / (1024 * 1024) / elapsed
-
-    if verbose:
-        print(f"🔒 Зашифрованный файл сохранён как: {output_path}")
-        print(f"⏱ Время: {elapsed:.2f} с | 🚀 Скорость: {speed:.2f} МБ/с")
-
-
-# --- File Decryption ---
-def decrypt_file(input_path, password, salt, output_path=None, verbose=False):
-    start_time = time.time()
-    key = generate_key(password.encode(), salt.encode())
-    prng = PRNG(int.from_bytes(key[:4], 'big'))
-
-    with open(input_path, 'rb') as f_in:
-        f_in.seek(0, os.SEEK_END)
-        file_size = f_in.tell()
-        if file_size < 32:
-            raise ValueError("Недопустимый размер файла")
-        f_in.seek(0)
-
-        encrypted_data_size = file_size - 32
-        decrypted = bytearray()
-
-        with tqdm(total=encrypted_data_size, unit='B', unit_scale=True, desc='Дешифрование',
-                  disable=not verbose) as pbar:
-            buffer = bytearray()
-            while encrypted_data_size > 0:
-                chunk = f_in.read(1024 * 1024 * 8)
-                encrypted_data_size -= len(chunk)
-                buffer.extend(chunk)
-                processed, buffer = process_chunk(buffer, prng, 16, encrypt=False)
-                decrypted.extend(processed)
-                pbar.update(len(processed))
-
-            stored_hash = xor_bytes(f_in.read(32), prng.rand_bytes(32))
-            computed_hash = SHA256()
-            computed_hash.update(bytes(decrypted))  # Преобразуем bytearray в bytes
-
-            if stored_hash != computed_hash.digest():
-                raise ValueError("Хэш не совпадает")
-
-        # Remove padding
-        pad_len = decrypted[-1]
-        decrypted = decrypted[:-pad_len]
-
-        # Generate output path
-        if output_path is None:
-            if input_path.endswith('.enc'):
-                output_path = input_path[:-4]
-            else:
-                output_path = input_path + '.dec'
-
-        with open(output_path, 'wb') as f_out:
-            f_out.write(decrypted)
-
-    elapsed = time.time() - start_time
-    speed = (file_size - 32) / (1024 * 1024) / elapsed
-
-    if verbose:
-        print(f"🔓 Расшифрованный файл сохранён как: {output_path}")
-        print(f"⏱ Время: {elapsed:.2f} с | 🚀 Скорость: {speed:.2f} МБ/с")
-
-    return output_path
-
-
-# --- CLI Entry Point ---
 def main():
-    parser = argparse.ArgumentParser(description="Шифрование файлов")
-    parser.add_argument('--encrypt', action='store_true')
-    parser.add_argument('--decrypt', action='store_true')
-    parser.add_argument('--input', type=str, required=True)
-    parser.add_argument('--output', type=str)
-    parser.add_argument('--password', type=str, required=True)
-    parser.add_argument('--salt', type=str, default='s@1t')
-    parser.add_argument('--verbose', action='store_true')
+    import argparse
+    parser = argparse.ArgumentParser(description='Утилита для шифрования и расшифрования данных')
+    parser.add_argument('action', choices=['encrypt', 'decrypt', 'encrypt-dir', 'decrypt-dir'],
+                        help='Действие: encrypt/decrypt для файлов, encrypt-dir/decrypt-dir для каталогов')
+    parser.add_argument('input', help='Входной файл или каталог')
+    parser.add_argument('output', help='Выходной файл или каталог')
+    parser.add_argument('-p', '--passphrase', required=True, help='Парольная фраза для шифрования')
+    parser.add_argument('-v', '--verbose', action='store_true', help='Подробный вывод')
     args = parser.parse_args()
 
-    if args.encrypt:
-        output_path = args.output or args.input + '.enc'
-        encrypt_file(args.input, output_path, args.password, args.salt, args.verbose)
+    crypto = CryptoCLI(verbose=args.verbose)
+    try:
+        start_time = time.time()
 
-    elif args.decrypt:
-        decrypt_file(args.input, args.password, args.salt, args.output, args.verbose)
+        if args.action == 'encrypt':
+            crypto.encrypt_file(args.input, args.output, args.passphrase)
+        elif args.action == 'decrypt':
+            crypto.decrypt_file(args.input, args.output, args.passphrase)
+        elif args.action == 'encrypt-dir':
+            crypto.encrypt_directory(args.input, args.output, args.passphrase)
+        elif args.action == 'decrypt-dir':
+            crypto.decrypt_directory(args.input, args.output, args.passphrase)
 
-    else:
-        parser.print_help()
+        elapsed = time.time() - start_time
+        print(f"Операция успешно завершена за {elapsed:.2f} секунд")
+
+        if args.verbose:
+            print("\nПодробный лог выполнения:")
+            for log in crypto.logs:
+                print(f"[LOG] {log}")
+
+    except ValueError as e:
+        print(f"Ошибка: {str(e)}", file=sys.stderr)
+        sys.exit(1)
+    except Exception as e:
+        print(f"Неожиданная ошибка: {str(e)}", file=sys.stderr)
+        sys.exit(1)
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
+    multiprocessing.freeze_support()
     main()
